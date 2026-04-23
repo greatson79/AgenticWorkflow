@@ -54,6 +54,12 @@ CLEAR_POSITIONS = frozenset({3, 6, 9, 12, 14, 17, 20, 23, 26, 29, 33, 36, 39, 42
 # 1번도 포함 (최초 시작)
 NEW_SESSION_STARTS = frozenset({1, 4, 7, 10, 13, 15, 18, 21, 24, 27, 30, 34, 37, 40, 43, 48, 51, 54, 59, 62, 65, 68, 71, 74, 77, 80, 83, 86, 89, 92, 96, 99, 102, 105, 108})
 
+# Rate-limit 재시도 설정 (Fix #2)
+# 일반 오류: 3회 재시도 (15초, 30초, 60초 대기)
+# Rate limit: 5분 간격으로 최대 60회 재시도 (= 최대 5시간 대기)
+MAX_RATE_LIMIT_RETRIES = 60   # 5분 × 60 = 최대 5시간
+RATE_LIMIT_WAIT = 300         # 5분
+
 
 # ═══════════════════════════════════════════════════════════════
 #  최고 성능 모델 자동 선택
@@ -171,6 +177,7 @@ def state_init() -> dict:
         "clears": [],
         "failed": [],
         "sessions": {},  # {session_id: [step1, step2, ...]}
+        "rate_limit_state": None,  # (Fix #4) rate-limit 상태 기록
     }
     _state_save(s)
     return s
@@ -213,6 +220,23 @@ def state_update_session_id(s: dict, session_id: str):
 
 def state_record_fail(s: dict, step: int):
     s["failed"].append(step)
+    _state_save(s)
+
+
+def state_record_rate_limit_exceeded(s: dict, step: int, attempt_count: int, max_attempts: int):
+    """Rate-limit 초과 상태를 state.json에 기록 (복구용)"""
+    from datetime import timezone
+
+    now = datetime.now(timezone.utc)
+    next_retry_at = (now + timedelta(seconds=RATE_LIMIT_WAIT)).isoformat()
+
+    s["rate_limit_state"] = {
+        "step": step,
+        "attempt_count": attempt_count,
+        "max_attempts": max_attempts,
+        "last_wait_time": now.isoformat(),
+        "next_retry_at": next_retry_at,
+    }
     _state_save(s)
 
 
@@ -1006,20 +1030,18 @@ def run_with_retry(
     project_dir: Path = None,
     model: str = None,
     idle_timeout: int = 0,
+    state: dict = None,
     **kwargs,
 ) -> tuple:  # (verdict, session_id, total_duration)
     """
     재시도를 포함한 프롬프트 실행.
-    
+
     일반 오류: 3회 재시도 (15초, 30초, 60초 대기)
     Rate limit: 5분 간격으로 최대 60회 재시도 (= 최대 5시간 대기)
     """
-    
+
     total_duration = 0
     rate_limit_retries = 0
-    MAX_RATE_LIMIT_RETRIES = 30  # 10분 × 30 = 최대 5시간
-    RATE_LIMIT_WAIT = 600  # 10분
-    
     attempt = 0
     
     while True:
@@ -1050,11 +1072,22 @@ def run_with_retry(
         err_file = LOGS_DIR / f"{step:03d}.error.log"
         stdout_file = LOGS_DIR / f"{step:03d}.log"
         stream_file = LOGS_DIR / f"{step:03d}.stream.jsonl"
-        
+
+        # Rate-limit 전용 키워드만 (false positive 제거) (Fix #3)
+        RATE_LIMIT_KEYWORDS = [
+            "rate limit",
+            "rate_limit",
+            "hit your limit",
+            "hitting the rate limit",
+            "you have exceeded",
+            "quota exceeded",
+            "too many requests",  # HTTP 429
+        ]
+
         for check_file in [err_file, stdout_file, stream_file]:
             if check_file.exists():
                 content = check_file.read_text(encoding='utf-8').lower()
-                if any(kw in content for kw in ["rate limit", "hit your limit", "too many", "try again", "rate_limit", "overloaded"]):
+                if any(kw in content for kw in RATE_LIMIT_KEYWORDS):
                     is_rate_limit = True
                     break
         
@@ -1079,7 +1112,9 @@ def run_with_retry(
             rate_limit_retries += 1
             if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
                 log.error(f"[{step:03d}] Rate limit 대기 {MAX_RATE_LIMIT_RETRIES}회 초과. 중단.")
-                break
+                if state:
+                    state_record_rate_limit_exceeded(state, step, rate_limit_retries, MAX_RATE_LIMIT_RETRIES)
+                return ("rate_limit_exceeded", session_id, total_duration)
             
             mins_waited = rate_limit_retries * RATE_LIMIT_WAIT // 60
             log.warning(f"")
@@ -1566,6 +1601,7 @@ def main():
             project_dir=project_dir,
             model=args.model,
             idle_timeout=args.idle_timeout,
+            state=state,
         )
         
         # ─── 세션 ID 갱신 — 매 step마다 최신 session_id 추적 ───
@@ -1614,7 +1650,15 @@ def main():
             else:
                 use_continue = True
             state_record_complete(state, step)
-        
+
+        elif verdict == "rate_limit_exceeded":
+            # Rate-limit은 일시적 오류 — 실패가 아니라 시간 초과
+            log.warning(f"[{step:03d}] ⏸ Rate-limit 초과 (최대 {MAX_RATE_LIMIT_RETRIES}회 대기)")
+            log.warning(f"[{step:03d}]   rate_limit_state에 상태 저장됨")
+            log.warning(f"[{step:03d}]   재개 명령: python3 run.py --resume")
+            _state_save(state)
+            sys.exit(0)  # 정상 종료 (에러 아님)
+
         else:  # "failed"
             state_record_fail(state, step)
             log.error(f"[{step:03d}] 최종 실패. 중단합니다.")
