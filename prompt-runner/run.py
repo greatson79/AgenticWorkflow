@@ -72,7 +72,9 @@ import logging
 import argparse
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+from state_manager import StateManager, StateCorruptError
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -221,6 +223,9 @@ PROMPTS_DIR = SCRIPT_DIR / "prompts"
 LOGS_DIR = SCRIPT_DIR / "logs"
 STATE_FILE = SCRIPT_DIR / "state.json"
 
+# StateManager (Flaw #2, #3 — Atomic Write + Corrupt Recovery + audit_log integration)
+state_manager = StateManager(STATE_FILE)
+
 
 # ═══════════════════════════════════════════════════════════════
 #  로깅
@@ -265,16 +270,47 @@ def state_init() -> dict:
 
 
 def state_load() -> dict:
-    """기존 상태 로드"""
-    with open(STATE_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    """Load existing state with automatic corruption recovery
+
+    Uses StateManager which:
+    1. Tries primary state.json
+    2. Auto-recovers from backups if corrupt
+    3. Restores backup to primary if needed
+
+    Returns:
+        State dict
+
+    Raises:
+        StateCorruptError: If all backups are corrupt
+        SystemExit: Exits with code 1 if unrecoverable
+    """
+    try:
+        return state_manager.load()
+    except StateCorruptError as e:
+        log.error(f"[STATE] CORRUPTION UNRECOVERABLE: {e}")
+        sys.exit(1)
 
 
 def _state_save(s: dict):
-    """상태 저장"""
-    s["last_updated"] = datetime.now().isoformat()
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(s, f, indent=2, ensure_ascii=False)
+    """Save state with atomic write + backup rotation
+
+    Uses StateManager which:
+    1. Rotates backups (backup.1 → backup.2 → backup.3)
+    2. Writes to temporary file
+    3. Validates schema (Pydantic)
+    4. Atomically renames (tmp → primary)
+
+    Args:
+        s: State dict to save
+
+    Raises:
+        SystemExit: Exits with code 1 if save fails
+    """
+    try:
+        state_manager.save(s)
+    except Exception as e:
+        log.error(f"[STATE] SAVE FAILED: {e}")
+        sys.exit(1)
 
 
 def state_record_complete(s: dict, step: int):
@@ -284,23 +320,50 @@ def state_record_complete(s: dict, step: int):
     sid = s.get("current_session_id")
     if sid:
         s["sessions"].setdefault(sid, []).append(step)
+
+    # P1: Audit logging (merged into state.json)
+    state_manager.record_audit(s, step, "run_prompt", {
+        "status": "completed",
+        "session_id": sid
+    })
+
     _state_save(s)
 
 
 def state_record_clear(s: dict, step: int):
+    old_session_id = s.get("current_session_id")
     s["clears"].append(step)
     s["current_session_id"] = None  # 세션 ID 해제
     s["current_step"] = step + 1
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "clear", {
+        "cleared_session": old_session_id
+    })
+
     _state_save(s)
 
 
 def state_update_session_id(s: dict, session_id: str):
+    step = s.get("current_step", 0)
     s["current_session_id"] = session_id
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "session_change", {
+        "new_session_id": session_id
+    })
+
     _state_save(s)
 
 
 def state_record_fail(s: dict, step: int):
     s["failed"].append(step)
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "run_prompt", {
+        "status": "failed"
+    })
+
     _state_save(s)
 
 
@@ -319,10 +382,24 @@ def state_record_rate_limit_exceeded(s: dict, step: int, attempt_count: int, max
         "next_retry_at": next_retry_at,
     }
 
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "rate_limit", {
+        "attempt_count": attempt_count,
+        "max_attempts": max_attempts,
+        "next_retry_at": next_retry_at
+    })
+
 
 def state_finish(s: dict):
+    step = s.get("current_step", 0)
     s["status"] = "done"
     s["finished_at"] = datetime.now().isoformat()
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "run_prompt", {
+        "status": "workflow_completed"
+    })
+
     _state_save(s)
 
 
@@ -1701,6 +1778,27 @@ def main():
     # ─── 5. 시작점 결정 ───
     if args.resume and STATE_FILE.exists():
         state = state_load()
+
+        # P1: Step Mismatch Recovery (Design Requirement: P1.1)
+        expected_step = max(state["completed"]) + 1 if state["completed"] else 1
+        actual_step = state["current_step"]
+
+        if actual_step != expected_step:
+            log.warning(f"[RESUME] Step consistency check failed")
+            log.warning(f"  Expected: {expected_step} (based on completed array)")
+            log.warning(f"  Actual: {actual_step} (from state.json)")
+            log.warning(f"  Auto-correcting to {expected_step}")
+            state["current_step"] = expected_step
+
+            # P1: Audit logging for step mismatch correction
+            state_manager.record_audit(state, expected_step, "run_prompt", {
+                "event": "step_mismatch_auto_corrected",
+                "expected_step": expected_step,
+                "actual_step": actual_step
+            })
+
+            _state_save(state)
+
         start_from = state["current_step"]
         log.info(f"이전 상태에서 재개: Step {start_from}")
 
@@ -1727,6 +1825,13 @@ def main():
             else:
                 log.info(f"[{start_from:03d}] 대기 시간 만료, 즉시 재개")
                 state["rate_limit_state"] = None  # 복구 완료, 상태 초기화
+
+                # P1: Audit logging for rate-limit wait completion
+                state_manager.record_audit(state, start_from, "rate_limit", {
+                    "event": "rate_limit_wait_completed",
+                    "recovered_from_step": rate_limit_state["step"]
+                })
+
                 _state_save(state)
 
         if start_from > TOTAL_PROMPTS:
