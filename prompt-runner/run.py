@@ -90,11 +90,30 @@ CLEAR_POSITIONS = frozenset({3, 6, 9, 12, 14, 17, 20, 23, 26, 29, 33, 36, 39, 42
 # 1번도 포함 (최초 시작)
 NEW_SESSION_STARTS = frozenset({1, 4, 7, 10, 13, 15, 18, 21, 24, 27, 30, 34, 37, 40, 43, 48, 51, 54, 59, 62, 65, 68, 71, 74, 77, 80, 83, 86, 89, 92, 96, 99, 102, 105, 108})
 
-# Rate-limit 재시도 설정 (Fix #2)
-# 일반 오류: 3회 재시도 (15초, 30초, 60초 대기)
-# Rate limit: 5분 간격으로 최대 60회 재시도 (= 최대 5시간 대기)
-MAX_RATE_LIMIT_RETRIES = 60   # 5분 × 60 = 최대 5시간
-RATE_LIMIT_WAIT = 300         # 5분
+# ═══════════════════════════════════════════════════════════════
+#  P2 Phase 2: Rate-Limit 정책 클래스 (P1-P5 Substitutions)
+# ═══════════════════════════════════════════════════════════════
+
+# P1: Custom RateLimitError
+class RateLimitError(Exception):
+    """Rate-limit 초과 또는 복구 불가능한 상태"""
+    pass
+
+
+# P3: RateLimitPolicy — 모든 상수를 클래스로 캡슐화
+class RateLimitPolicy:
+    """Rate-limit 정책 설정 (DRY principle)"""
+    MAX_NORMAL_RETRIES = 3          # 일반 오류: 3회 재시도
+    MAX_RATE_LIMIT_RETRIES = 60     # Rate-limit: 60회 재시도 (5시간)
+    RATE_LIMIT_WAIT = 300           # 5분 대기
+
+    # 일반 재시도 대기 시간 (지수 백오프)
+    NORMAL_RETRY_WAITS = [15, 30, 60]  # 15초, 30초, 60초
+
+
+# P4: 모듈 레벨 상수로 정책 노출 (기존 코드 호환성)
+MAX_RATE_LIMIT_RETRIES = RateLimitPolicy.MAX_RATE_LIMIT_RETRIES
+RATE_LIMIT_WAIT = RateLimitPolicy.RATE_LIMIT_WAIT
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -117,11 +136,11 @@ THINKING_BUDGET_TOKENS = 16000   # Claude Opus의 extended thinking 최대
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Rate-Limit 처리 (P3: 모듈화)
+#  Rate-Limit 처리 (P2 완성: RateLimitHandler + RateLimitPolicy)
 # ═══════════════════════════════════════════════════════════════
 
 class RateLimitHandler:
-    """Rate-limit 감지·재시도·상태 관리 클래스"""
+    """Rate-limit 감지·재시도·상태 관리 클래스 (P2)"""
 
     # Rate-limit 전용 키워드 (false positive 제거)
     KEYWORDS = [
@@ -134,8 +153,8 @@ class RateLimitHandler:
         "too many requests",  # HTTP 429
     ]
 
-    MAX_RETRIES = MAX_RATE_LIMIT_RETRIES  # 60회
-    WAIT_SECONDS = RATE_LIMIT_WAIT        # 300초 (5분)
+    MAX_RETRIES = RateLimitPolicy.MAX_RATE_LIMIT_RETRIES  # P3: 정책 클래스 참조
+    WAIT_SECONDS = RateLimitPolicy.RATE_LIMIT_WAIT        # P3: 정책 클래스 참조
 
     @staticmethod
     def detect(err_file: Path, stdout_file: Path, stream_file: Path) -> bool:
@@ -1183,7 +1202,7 @@ def run_with_retry(
     step: int,
     prompt_file: Path,
     session_id: str = None,
-    max_retries: int = 3,
+    max_retries: int = None,  # P3: Use RateLimitPolicy
     project_dir: Path = None,
     model: str = None,
     idle_timeout: int = 0,
@@ -1193,9 +1212,16 @@ def run_with_retry(
     """
     재시도를 포함한 프롬프트 실행.
 
-    일반 오류: 3회 재시도 (15초, 30초, 60초 대기)
-    Rate limit: 5분 간격으로 최대 60회 재시도 (= 최대 5시간 대기)
+    일반 오류: MAX_NORMAL_RETRIES회 재시도 (지수 백오프)
+    Rate limit: MAX_RATE_LIMIT_RETRIES회 재시도 (= 최대 5시간 대기)
+
+    P2 Substitutions:
+    - P3: max_retries = RateLimitPolicy.MAX_NORMAL_RETRIES
     """
+
+    # P3: Set default from policy if not provided
+    if max_retries is None:
+        max_retries = RateLimitPolicy.MAX_NORMAL_RETRIES
 
     total_duration = 0
     rate_limit_retries = 0
@@ -1920,7 +1946,7 @@ def main():
             step=step,
             prompt_file=prompt_file,
             session_id=session_arg,
-            max_retries=3,
+            max_retries=RateLimitPolicy.MAX_NORMAL_RETRIES,  # P3: Use policy class
             max_turns=max_turns,
             timeout=timeout,
             skip_permissions=skip_perms,
