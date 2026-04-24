@@ -123,7 +123,8 @@ RATE_LIMIT_WAIT = RateLimitPolicy.RATE_LIMIT_WAIT
 # 모델 우선순위: 높은 숫자 = 더 최신·고성능
 # 새 모델 출시 시 이 목록에 추가하면 자동 선택됨
 _MODEL_PRIORITY: list[tuple[int, str]] = [
-    (1000, "claude-opus-4-6"),          # 최우선: opus 4.6
+    (1100, "claude-opus-4-7"),          # 최우선: opus 4.7 (default)
+    (1000, "claude-opus-4-6"),          # opus 4.6
     (990,  "claude-opus-4-5"),          # opus 4.5
     (980,  "claude-opus-4-0"),          # opus 4.0
     (970,  "claude-opus-4"),            # opus 4 (별칭)
