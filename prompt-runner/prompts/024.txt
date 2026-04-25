@@ -15,6 +15,8 @@
 [SESSION HEADER]
 이전 단계: 누락·불필요 성찰 및 반영 완료.
 이번 단계: 적대적 에이전트 A/B/C 기반 성찰 → 방어 불가 지점과 개선안 산출.
+[★ 제1 핵심 목적 — 절대 목표]
+( 여기에 내가 이 서비스를 만드는 가장 중요한 목적, 혹은 결과물의 모양과 수준을 적는다 )
 핵심 참조 파일: /prompt/prd-research/final-research.md
 [/SESSION HEADER]
 
