@@ -9,6 +9,8 @@
 [SESSION HEADER]
 이전 단계: workflow-idea ↔ workflow 반영 완결성 성찰 보고서.
 이번 단계: 권장 조치를 /prompt/workflow.md 에 반영.
+[★ 제1 핵심 목적 — 절대 목표로 모든 단계·기능에 고정]
+( 여기에 내가 이 서비스를 만드는 가장 중요한 목적, 혹은 결과물의 모양과 수준을 적는다 )
 [/SESSION HEADER]
 
 [작업 지시]

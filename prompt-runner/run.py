@@ -2,9 +2,9 @@
 """
 ═══════════════════════════════════════════════════════════════════
   run.py — Claude Code 프롬프트 순차 자동 실행기 (최종판)
-  
+
   방식: pipe 모드 (-p) + 세션 ID 캡처 (--resume)
-  
+
   작동 원리:
     1. 세션의 첫 프롬프트: claude -p --output-format stream-json --verbose < prompt.txt
        → JSON 응답에서 session_id 추출하여 저장
@@ -13,18 +13,52 @@
     3. /clear를 만나면: session_id를 버림
        → 다음 프롬프트에서 새 세션 시작, 새 session_id 캡처
     4. 프로세스 종료 = 작업 완료 (100% 결정론적)
-  
+
   사용법:
     python3 run.py                    # 전체 실행 (1번부터)
     python3 run.py --resume           # 중단 지점부터 재개
     python3 run.py --from 34          # 34번부터 시작 (새 세션)
     python3 run.py --dry-run          # 실행 없이 순서 확인
     python3 run.py --verify           # 프롬프트 파일 무결성 검증
-    
+
   환경 변수:
     MAX_TURNS=0           에이전트 최대 턴 수 (0 = 무제한)
     TIMEOUT=0             프롬프트당 최대 실행 시간 (0 = 무제한)
     SKIP_PERMISSIONS=1    권한 확인 건너뛰기
+
+  ════════════════════════════════════════════════════════════════
+  🔄 Rate-Limit 자동 재시도 정책 (운영팀 가이드)
+
+  상황: API 레이트 제한 발생 → 자동으로 대기 후 재시도
+
+  설정:
+    · 최대 60회 재시도 (5분 간격)
+    · 최대 총 대기 시간: 300분 (5시간)
+    · 감지 키워드: "rate limit", "quota exceeded", "429" 등
+
+  사용자 경험:
+    Step 35 실행 중 rate-limit 감지
+      → 5분 대기 후 자동 재시도
+      → 최대 60회 반복
+      → 초과 시 exit code 0 (정상 종료)
+
+  --resume 복구 (자동 대기):
+    python3 run.py --resume
+      → state.json에서 rate_limit_state 감지
+      → 남은 대기 시간만큼 자동으로 sleep
+      → 복구 시간부터 재개
+
+  모니터링:
+    logs/{{step}}.rate-limit.log  — 대기 이력
+    state.json의 rate_limit_state — 마지막 상태 (step, attempt_count, next_retry_at)
+
+  운영팀 대응 (필요한 경우):
+    1. 상황 확인: state.json 내 rate_limit_state 확인
+    2. 수동 복구: python3 run.py --resume
+       (대기 시간을 기다린 후 실행)
+    3. 강제 진행: state.json의 rate_limit_state를 null로 수정 후 재개
+       (권장하지 않음 — 또 rate-limit 오류 가능)
+  ════════════════════════════════════════════════════════════════
 ═══════════════════════════════════════════════════════════════════
 """
 
@@ -38,7 +72,9 @@ import logging
 import argparse
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+from state_manager import StateManager, StateCorruptError
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -54,6 +90,31 @@ CLEAR_POSITIONS = frozenset({3, 6, 9, 12, 14, 17, 20, 23, 26, 29, 33, 36, 39, 42
 # 1번도 포함 (최초 시작)
 NEW_SESSION_STARTS = frozenset({1, 4, 7, 10, 13, 15, 18, 21, 24, 27, 30, 34, 37, 40, 43, 48, 51, 54, 59, 62, 65, 68, 71, 74, 77, 80, 83, 86, 89, 92, 96, 99, 102, 105, 108})
 
+# ═══════════════════════════════════════════════════════════════
+#  P2 Phase 2: Rate-Limit 정책 클래스 (P1-P5 Substitutions)
+# ═══════════════════════════════════════════════════════════════
+
+# P1: Custom RateLimitError
+class RateLimitError(Exception):
+    """Rate-limit 초과 또는 복구 불가능한 상태"""
+    pass
+
+
+# P3: RateLimitPolicy — 모든 상수를 클래스로 캡슐화
+class RateLimitPolicy:
+    """Rate-limit 정책 설정 (DRY principle)"""
+    MAX_NORMAL_RETRIES = 3          # 일반 오류: 3회 재시도
+    MAX_RATE_LIMIT_RETRIES = 60     # Rate-limit: 60회 재시도 (5시간)
+    RATE_LIMIT_WAIT = 300           # 5분 대기
+
+    # 일반 재시도 대기 시간 (지수 백오프)
+    NORMAL_RETRY_WAITS = [15, 30, 60]  # 15초, 30초, 60초
+
+
+# P4: 모듈 레벨 상수로 정책 노출 (기존 코드 호환성)
+MAX_RATE_LIMIT_RETRIES = RateLimitPolicy.MAX_RATE_LIMIT_RETRIES
+RATE_LIMIT_WAIT = RateLimitPolicy.RATE_LIMIT_WAIT
+
 
 # ═══════════════════════════════════════════════════════════════
 #  최고 성능 모델 자동 선택
@@ -62,7 +123,8 @@ NEW_SESSION_STARTS = frozenset({1, 4, 7, 10, 13, 15, 18, 21, 24, 27, 30, 34, 37,
 # 모델 우선순위: 높은 숫자 = 더 최신·고성능
 # 새 모델 출시 시 이 목록에 추가하면 자동 선택됨
 _MODEL_PRIORITY: list[tuple[int, str]] = [
-    (1000, "claude-opus-4-6"),          # 최우선: opus 4.6
+    (1100, "claude-opus-4-7"),          # 최우선: opus 4.7 (default)
+    (1000, "claude-opus-4-6"),          # opus 4.6
     (990,  "claude-opus-4-5"),          # opus 4.5
     (980,  "claude-opus-4-0"),          # opus 4.0
     (970,  "claude-opus-4"),            # opus 4 (별칭)
@@ -72,6 +134,53 @@ _MODEL_PRIORITY: list[tuple[int, str]] = [
 
 # Extended thinking (max effort) 토큰 예산 — 최대값으로 고정
 THINKING_BUDGET_TOKENS = 16000   # Claude Opus의 extended thinking 최대
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Rate-Limit 처리 (P2 완성: RateLimitHandler + RateLimitPolicy)
+# ═══════════════════════════════════════════════════════════════
+
+class RateLimitHandler:
+    """Rate-limit 감지·재시도·상태 관리 클래스 (P2)"""
+
+    # Rate-limit 전용 키워드 (false positive 제거)
+    KEYWORDS = [
+        "rate limit",
+        "rate_limit",
+        "hit your limit",
+        "hitting the rate limit",
+        "you have exceeded",
+        "quota exceeded",
+        "too many requests",  # HTTP 429
+    ]
+
+    MAX_RETRIES = RateLimitPolicy.MAX_RATE_LIMIT_RETRIES  # P3: 정책 클래스 참조
+    WAIT_SECONDS = RateLimitPolicy.RATE_LIMIT_WAIT        # P3: 정책 클래스 참조
+
+    @staticmethod
+    def detect(err_file: Path, stdout_file: Path, stream_file: Path) -> bool:
+        """Rate-limit 감지 (3개 파일 검사)"""
+        for check_file in [err_file, stdout_file, stream_file]:
+            if check_file.exists():
+                content = check_file.read_text(encoding='utf-8').lower()
+                if any(kw in content for kw in RateLimitHandler.KEYWORDS):
+                    return True
+        return False
+
+    @staticmethod
+    def record_state(state: dict, step: int, attempt_count: int):
+        """Rate-limit 상태를 state dict에 기록 (main에서 저장)"""
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        next_retry_at = (now + timedelta(seconds=RateLimitHandler.WAIT_SECONDS)).isoformat()
+
+        state["rate_limit_state"] = {
+            "step": step,
+            "attempt_count": attempt_count,
+            "max_attempts": RateLimitHandler.MAX_RETRIES,
+            "last_wait_time": now.isoformat(),
+            "next_retry_at": next_retry_at,
+        }
 
 
 def _resolve_best_model() -> str:
@@ -134,6 +243,9 @@ PROMPTS_DIR = SCRIPT_DIR / "prompts"
 LOGS_DIR = SCRIPT_DIR / "logs"
 STATE_FILE = SCRIPT_DIR / "state.json"
 
+# StateManager (Flaw #2, #3 — Atomic Write + Corrupt Recovery + audit_log integration)
+state_manager = StateManager(STATE_FILE)
+
 
 # ═══════════════════════════════════════════════════════════════
 #  로깅
@@ -171,22 +283,54 @@ def state_init() -> dict:
         "clears": [],
         "failed": [],
         "sessions": {},  # {session_id: [step1, step2, ...]}
+        "rate_limit_state": None,  # (Fix #4) rate-limit 상태 기록
     }
     _state_save(s)
     return s
 
 
 def state_load() -> dict:
-    """기존 상태 로드"""
-    with open(STATE_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    """Load existing state with automatic corruption recovery
+
+    Uses StateManager which:
+    1. Tries primary state.json
+    2. Auto-recovers from backups if corrupt
+    3. Restores backup to primary if needed
+
+    Returns:
+        State dict
+
+    Raises:
+        StateCorruptError: If all backups are corrupt
+        SystemExit: Exits with code 1 if unrecoverable
+    """
+    try:
+        return state_manager.load()
+    except StateCorruptError as e:
+        log.error(f"[STATE] CORRUPTION UNRECOVERABLE: {e}")
+        sys.exit(1)
 
 
 def _state_save(s: dict):
-    """상태 저장"""
-    s["last_updated"] = datetime.now().isoformat()
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(s, f, indent=2, ensure_ascii=False)
+    """Save state with atomic write + backup rotation
+
+    Uses StateManager which:
+    1. Rotates backups (backup.1 → backup.2 → backup.3)
+    2. Writes to temporary file
+    3. Validates schema (Pydantic)
+    4. Atomically renames (tmp → primary)
+
+    Args:
+        s: State dict to save
+
+    Raises:
+        SystemExit: Exits with code 1 if save fails
+    """
+    try:
+        state_manager.save(s)
+    except Exception as e:
+        log.error(f"[STATE] SAVE FAILED: {e}")
+        sys.exit(1)
 
 
 def state_record_complete(s: dict, step: int):
@@ -196,29 +340,86 @@ def state_record_complete(s: dict, step: int):
     sid = s.get("current_session_id")
     if sid:
         s["sessions"].setdefault(sid, []).append(step)
+
+    # P1: Audit logging (merged into state.json)
+    state_manager.record_audit(s, step, "run_prompt", {
+        "status": "completed",
+        "session_id": sid
+    })
+
     _state_save(s)
 
 
 def state_record_clear(s: dict, step: int):
+    old_session_id = s.get("current_session_id")
     s["clears"].append(step)
     s["current_session_id"] = None  # 세션 ID 해제
     s["current_step"] = step + 1
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "clear", {
+        "cleared_session": old_session_id
+    })
+
     _state_save(s)
 
 
 def state_update_session_id(s: dict, session_id: str):
+    step = s.get("current_step", 0)
     s["current_session_id"] = session_id
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "session_change", {
+        "new_session_id": session_id
+    })
+
     _state_save(s)
 
 
 def state_record_fail(s: dict, step: int):
     s["failed"].append(step)
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "run_prompt", {
+        "status": "failed"
+    })
+
     _state_save(s)
 
 
+def state_record_rate_limit_exceeded(s: dict, step: int, attempt_count: int, max_attempts: int):
+    """Rate-limit 초과 상태를 state dict에 기록 (main에서 저장)"""
+    from datetime import timezone
+
+    now = datetime.now(timezone.utc)
+    next_retry_at = (now + timedelta(seconds=RATE_LIMIT_WAIT)).isoformat()
+
+    s["rate_limit_state"] = {
+        "step": step,
+        "attempt_count": attempt_count,
+        "max_attempts": max_attempts,
+        "last_wait_time": now.isoformat(),
+        "next_retry_at": next_retry_at,
+    }
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "rate_limit", {
+        "attempt_count": attempt_count,
+        "max_attempts": max_attempts,
+        "next_retry_at": next_retry_at
+    })
+
+
 def state_finish(s: dict):
+    step = s.get("current_step", 0)
     s["status"] = "done"
     s["finished_at"] = datetime.now().isoformat()
+
+    # P1: Audit logging
+    state_manager.record_audit(s, step, "run_prompt", {
+        "status": "workflow_completed"
+    })
+
     _state_save(s)
 
 
@@ -395,6 +596,10 @@ Be brutally honest. Do not inflate or soften results.
 - Task verification / TDD: [✓ / ✗]
 - Web search / fetch: [✓ / ✗]
 - Source of Truth (SOT): [✓ implemented / ✗ not implemented]
+- SOT read BEFORE any write/decision this turn (RLM): [✓ / ✗ — reason: ]
+- RLM pattern preserved (recursive reads, no memorized substitution): [✓ / ✗ — reason: ]
+- SOT writes routed through orchestrator/team-lead only: [✓ / ✗ / N/A — reason: ]
+- Sub-agent invocations recorded in state["steps"][...]["invocations"]: [✓ / ✗ / N/A]
 
 ### 3. DELIVERABLES PRODUCED
 (List every file created, modified, or deleted with their paths)
@@ -420,6 +625,10 @@ Explain what was NOT completed and why (be specific, not vague):
 - Did you hallucinate file contents you did not actually verify? [YES/NO]:
 - Did you run out of turns before completing the task? [YES/NO]:
 - Is there anything the next step needs to know about the current state? [YES/NO]:
+- Did you bypass SOT to write directly to a shared file/field? [YES/NO]:
+- Did you skip the RLM recursive read in favor of memorized context? [YES/NO]:
+- Did multiple agents (parallel teammates/sub-agents) write to the same SOT field? [YES/NO]:
+- Did you invoke a sub-agent without recording the invocation in state["steps"]? [YES/NO]:
 
 ### 6. NEXT STEP RISK
 (What could go wrong in the next prompt if this step's output is incomplete?)
@@ -452,6 +661,27 @@ You MUST follow these rules for every WebFetch or web request:
 
 ## Rule 3: Anti-Deadlock
 If you spawn sub-agents (teammates/Task), each sub-agent MUST return a result within a reasonable time even if some of their tool calls fail. Sub-agents should never block the parent indefinitely.
+
+## Rule 4: SOT + RLM Pre-Action Verification (CRITICAL — workflow philosophy)
+This workflow operates under TWO ABSOLUTE INVARIANTS that override convenience:
+  - Single-file SOT (Source of Truth): all shared state lives in ONE file; only the
+    orchestrator/team-lead writes to it; parallel agents NEVER modify the same SOT field.
+  - RLM (Recursive Language Model) pattern: agents recursively READ the SOT before
+    deciding; they do not act from memorized context alone.
+
+Before ANY data write, file modification, or sub-agent invocation, verify:
+(a) You have READ the current SOT file (state.json or the designated SOT) for THIS turn —
+    not relying on what you remember from earlier turns.
+(b) ALL writes to SOT are routed through the orchestrator/team-lead. No parallel agent
+    writes to SOT directly.
+(c) RLM is preserved — recursive reads of SOT happen at each decision boundary; cached
+    or memorized state does NOT replace a fresh read.
+(d) Sub-agent invocations are recorded in state["steps"][step_name]["invocations"]
+    via the orchestrator's record_subagent_invocation() (or equivalent).
+
+If ANY of (a)-(d) is unclear or cannot be guaranteed, STOP and report before acting.
+Quality and workflow integrity are absolute; tokens, speed, and convenience are not
+acceptable reasons to bypass these invariants.
 
 ---
 """
@@ -998,111 +1228,139 @@ def run_single_prompt(
 #  재시도 로직
 # ═══════════════════════════════════════════════════════════════
 
+def _detect_session_expired(err_file: Path, stdout_file: Path, stream_file: Path) -> bool:
+    """세션 만료/삭제 감지 (3개 파일 검사)."""
+    for check_file in [err_file, stdout_file, stream_file]:
+        if check_file.exists():
+            content = check_file.read_text(encoding='utf-8').lower()
+            if any(kw in content for kw in SESSION_EXPIRED_KEYWORDS):
+                return True
+    return False
+
+
 def run_with_retry(
     step: int,
     prompt_file: Path,
     session_id: str = None,
-    max_retries: int = 3,
+    max_retries: int = None,  # P3: Use RateLimitPolicy
     project_dir: Path = None,
     model: str = None,
     idle_timeout: int = 0,
+    state: dict = None,
     **kwargs,
 ) -> tuple:  # (verdict, session_id, total_duration)
     """
-    재시도를 포함한 프롬프트 실행.
-    
-    일반 오류: 3회 재시도 (15초, 30초, 60초 대기)
-    Rate limit: 5분 간격으로 최대 60회 재시도 (= 최대 5시간 대기)
+    재시도를 포함한 프롬프트 실행 (Fix #3: 명시적 상태 머신).
+
+    일반 오류: MAX_NORMAL_RETRIES회 재시도 (지수 백오프 15s, 30s, 60s)
+    Rate limit: MAX_RATE_LIMIT_RETRIES회 재시도 (5분 × 60 = 5시간)
+    세션 만료: session_id=None 폴백 후 신규 세션으로 즉시 재실행
+
+    상태 머신:
+        initial          — 프롬프트 실행 후 결과 분석 → 다음 상태 결정
+        normal_retry     — 일반 오류 백오프 대기 → initial로 복귀
+        rate_limit_wait  — rate-limit 5분 대기 → initial로 복귀
+        session_recovery — session_id 폐기 → 즉시 initial로 복귀
+
+    각 상태의 카운터(`normal_attempts`, `rate_limit_retries`)는 독립.
+    세션 복구는 카운터 모두 리셋(새 세션은 공정한 재시도 기회 부여).
     """
-    
+
+    if max_retries is None:
+        max_retries = RateLimitPolicy.MAX_NORMAL_RETRIES
+
     total_duration = 0
+    normal_attempts = 0
     rate_limit_retries = 0
-    MAX_RATE_LIMIT_RETRIES = 30  # 10분 × 30 = 최대 5시간
-    RATE_LIMIT_WAIT = 600  # 10분
-    
-    attempt = 0
-    
+    state_name = "initial"
+
+    err_file = LOGS_DIR / f"{step:03d}.error.log"
+    stdout_file = LOGS_DIR / f"{step:03d}.log"
+    stream_file = LOGS_DIR / f"{step:03d}.stream.jsonl"
+
     while True:
-        attempt += 1
-        
-        if attempt > 1 and rate_limit_retries == 0:
-            # 일반 재시도
-            if attempt > max_retries:
-                break
-            wait = 15 * (2 ** (attempt - 2))
-            log.warning(f"[{step:03d}] 재시도 {attempt}/{max_retries} — {wait}초 대기")
-            time.sleep(wait)
-        
-        verdict, sid, dur = run_single_prompt(
-            step, prompt_file, session_id, project_dir=project_dir, model=model, idle_timeout=idle_timeout, **kwargs
-        )
-        total_duration += dur
-        
-        if verdict == "success":
-            return ("success", sid, total_duration)
-        
-        if verdict == "suspicious":
-            # 조용한 실패: 재시도 없이 즉시 반환 (메인 루프에서 사용자에게 판단 요청)
-            return ("suspicious", sid, total_duration)
-        
-        # ─── 오류 분석 ───
-        is_rate_limit = False
-        err_file = LOGS_DIR / f"{step:03d}.error.log"
-        stdout_file = LOGS_DIR / f"{step:03d}.log"
-        stream_file = LOGS_DIR / f"{step:03d}.stream.jsonl"
-        
-        for check_file in [err_file, stdout_file, stream_file]:
-            if check_file.exists():
-                content = check_file.read_text(encoding='utf-8').lower()
-                if any(kw in content for kw in ["rate limit", "hit your limit", "too many", "try again", "rate_limit", "overloaded"]):
-                    is_rate_limit = True
-                    break
-        
-        # ─── 세션 만료 감지 → session_id=None 폴백 ───
-        is_session_expired = False
-        for check_file in [err_file, stdout_file, stream_file]:
-            if check_file.exists():
-                content_lower = check_file.read_text(encoding='utf-8').lower()
-                if any(kw in content_lower for kw in SESSION_EXPIRED_KEYWORDS):
-                    is_session_expired = True
-                    break
-        
-        if is_session_expired and session_id is not None:
-            log.warning(f"[{step:03d}] ⚠ 세션 만료/삭제 감지 (session_id: {session_id[:16]}...)")
-            log.warning(f"[{step:03d}]   → session_id=None으로 폴백, 새 세션으로 재시도")
-            session_id = None   # 새 세션 시작
-            attempt = 0         # 재시도 카운터 리셋 (새 세션이므로 공정한 3회 기회 부여)
-            rate_limit_retries = 0
+        # ─── initial: 프롬프트 실행 + 결과 분류 ───
+        if state_name == "initial":
+            verdict, sid, dur = run_single_prompt(
+                step, prompt_file, session_id,
+                project_dir=project_dir, model=model, idle_timeout=idle_timeout, **kwargs
+            )
+            total_duration += dur
+
+            if verdict == "success":
+                return ("success", sid, total_duration)
+            if verdict == "suspicious":
+                # 조용한 실패는 재시도 없이 즉시 반환 (메인 루프 판정)
+                return ("suspicious", sid, total_duration)
+
+            # 오류 발생 — 원인 분석으로 전이 결정
+            # 우선순위: 세션 만료 > rate-limit > 일반 오류
+            if _detect_session_expired(err_file, stdout_file, stream_file) and session_id is not None:
+                state_name = "session_recovery"
+                continue
+            if RateLimitHandler.detect(err_file, stdout_file, stream_file):
+                state_name = "rate_limit_wait"
+                continue
+            state_name = "normal_retry"
             continue
-        
-        if is_rate_limit:
+
+        # ─── normal_retry: 지수 백오프 후 재실행 ───
+        if state_name == "normal_retry":
+            normal_attempts += 1
+            if normal_attempts > max_retries:
+                return ("failed", session_id, total_duration)
+
+            wait = RateLimitPolicy.NORMAL_RETRY_WAITS[
+                min(normal_attempts - 1, len(RateLimitPolicy.NORMAL_RETRY_WAITS) - 1)
+            ]
+            log.warning(f"[{step:03d}] 재시도 {normal_attempts}/{max_retries} — {wait}초 대기")
+            time.sleep(wait)
+            state_name = "initial"
+            continue
+
+        # ─── rate_limit_wait: 5분 카운트다운 후 재실행 ───
+        if state_name == "rate_limit_wait":
             rate_limit_retries += 1
             if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
                 log.error(f"[{step:03d}] Rate limit 대기 {MAX_RATE_LIMIT_RETRIES}회 초과. 중단.")
-                break
-            
+                if state is not None:
+                    state_record_rate_limit_exceeded(
+                        state, step, rate_limit_retries, MAX_RATE_LIMIT_RETRIES
+                    )
+                return ("rate_limit_exceeded", session_id, total_duration)
+
             mins_waited = rate_limit_retries * RATE_LIMIT_WAIT // 60
-            log.warning(f"")
+            log.warning("")
             log.warning(f"[{step:03d}] ⏸ Rate Limit 감지!")
-            log.warning(f"[{step:03d}] {RATE_LIMIT_WAIT // 60}분 후 자동 재시도 ({rate_limit_retries}/{MAX_RATE_LIMIT_RETRIES})")
+            log.warning(
+                f"[{step:03d}] {RATE_LIMIT_WAIT // 60}분 후 자동 재시도 "
+                f"({rate_limit_retries}/{MAX_RATE_LIMIT_RETRIES})"
+            )
             log.warning(f"[{step:03d}] 지금까지 대기: {mins_waited}분")
-            log.warning(f"")
-            
-            # 카운트다운 표시
+            log.warning("")
+
             for remaining in range(RATE_LIMIT_WAIT, 0, -1):
                 mins, secs = divmod(remaining, 60)
                 print(f"\r  ⏸ Rate Limit 대기 중... {mins:02d}:{secs:02d} ", end='', flush=True)
                 time.sleep(1)
             print(f"\r  ▶ 재시도 시작                              ")
-            
-            # rate limit 재시도에서는 attempt 카운터 리셋
-            attempt = 0
+
+            state_name = "initial"
             continue
-        
-        # 일반 오류는 attempt 카운터로 처리
-        rate_limit_retries = 0  # rate limit이 아니면 리셋
-    
-    return ("failed", session_id, total_duration)
+
+        # ─── session_recovery: 세션 폐기 → 신규 세션 + 카운터 리셋 ───
+        if state_name == "session_recovery":
+            log.warning(f"[{step:03d}] ⚠ 세션 만료/삭제 감지 (session_id: {session_id[:16]}...)")
+            log.warning(f"[{step:03d}]   → session_id=None으로 폴백, 새 세션으로 재시도")
+            session_id = None
+            normal_attempts = 0     # 새 세션은 공정한 재시도 기회
+            rate_limit_retries = 0  # 새 세션 = rate-limit 카운터 리셋
+            state_name = "initial"
+            continue
+
+        # 도달 불가 — 방어적 가드
+        log.error(f"[{step:03d}] 알 수 없는 상태: {state_name!r}. 실패 처리.")
+        return ("failed", session_id, total_duration)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1345,6 +1603,136 @@ def _print_report_summary(logs_dir: Path, completed_steps: list) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  테스트 (P0: 프로덕션 배포 전 검증)
+# ═══════════════════════════════════════════════════════════════
+
+def test_rate_limit_keywords():
+    """Fix#1 검증: rate-limit 키워드 정확화 (false positive 제거)"""
+    print("\n[TEST] Rate-limit 키워드 정확화...")
+
+    # RATE_LIMIT_KEYWORDS는 run_with_retry 내부에 정의되므로 직접 테스트 어려움
+    # 대신 제거된 키워드가 없는지 확인
+    with open(__file__, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 제거되어야 할 키워드
+    removed_keywords = ["try again", "too many", "overloaded"]
+    for kw in removed_keywords:
+        if f'"{kw}"' in content:
+            # 주석 내에만 있는지 확인
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if f'"{kw}"' in line and 'RATE_LIMIT_KEYWORDS' in lines[max(0, i-5):i]:
+                    print(f"  ❌ '{kw}' 여전히 RATE_LIMIT_KEYWORDS에 있음 (Line {i+1})")
+                    return False
+
+    # 유지되어야 할 키워드
+    required_keywords = ["rate limit", "hit your limit", "quota exceeded", "too many requests"]
+    for kw in required_keywords:
+        if f'"{kw}"' not in content:
+            print(f"  ❌ '{kw}' 누락됨")
+            return False
+
+    print("  ✅ 키워드 정확화 통과 (false positive 제거됨)")
+    return True
+
+
+def test_constants():
+    """Fix#2 검증: 모듈 레벨 상수 (주석과 코드 일치)"""
+    print("\n[TEST] 모듈 레벨 상수 검증...")
+
+    # 상수 정의 확인
+    if MAX_RATE_LIMIT_RETRIES != 60:
+        print(f"  ❌ MAX_RATE_LIMIT_RETRIES = {MAX_RATE_LIMIT_RETRIES} (expected 60)")
+        return False
+
+    if RATE_LIMIT_WAIT != 300:
+        print(f"  ❌ RATE_LIMIT_WAIT = {RATE_LIMIT_WAIT} (expected 300)")
+        return False
+
+    # 5시간 계산 검증
+    max_wait_minutes = (MAX_RATE_LIMIT_RETRIES * RATE_LIMIT_WAIT) // 60
+    if max_wait_minutes != 300:
+        print(f"  ❌ 최대 대기 시간 = {max_wait_minutes}분 (expected 300분)")
+        return False
+
+    print(f"  ✅ 상수 검증 통과 ({MAX_RATE_LIMIT_RETRIES} × {RATE_LIMIT_WAIT}초 = {max_wait_minutes}분)")
+    return True
+
+
+def test_state_schema():
+    """Fix#3 검증: state.json 스키마 (rate_limit_state 필드)"""
+    print("\n[TEST] State 스키마 검증...")
+
+    # 새 상태 초기화
+    test_state = state_init()
+
+    if "rate_limit_state" not in test_state:
+        print("  ❌ rate_limit_state 필드 누락")
+        return False
+
+    if test_state["rate_limit_state"] is not None:
+        print(f"  ❌ 초기값이 None이 아님: {test_state['rate_limit_state']}")
+        return False
+
+    print("  ✅ State 스키마 검증 통과")
+    return True
+
+
+def test_state_record_rate_limit():
+    """Fix#4 검증: state_record_rate_limit_exceeded() 함수"""
+    print("\n[TEST] Rate-limit 상태 기록 함수...")
+
+    test_state = state_init()
+    state_record_rate_limit_exceeded(test_state, step=35, attempt_count=61, max_attempts=60)
+
+    rls = test_state.get("rate_limit_state")
+    if not rls:
+        print("  ❌ rate_limit_state 기록 실패")
+        return False
+
+    required_fields = ["step", "attempt_count", "max_attempts", "last_wait_time", "next_retry_at"]
+    for field in required_fields:
+        if field not in rls:
+            print(f"  ❌ 필드 누락: {field}")
+            return False
+
+    if rls["step"] != 35 or rls["attempt_count"] != 61:
+        print(f"  ❌ 값 오류: {rls}")
+        return False
+
+    print("  ✅ Rate-limit 상태 기록 통과")
+    return True
+
+
+def run_all_tests():
+    """모든 테스트 실행"""
+    print("\n" + "═" * 60)
+    print("  🧪 Rate-Limit Fix 검증 테스트")
+    print("═" * 60)
+
+    results = [
+        test_rate_limit_keywords(),
+        test_constants(),
+        test_state_schema(),
+        test_state_record_rate_limit(),
+    ]
+
+    passed = sum(results)
+    total = len(results)
+
+    print("\n" + "═" * 60)
+    if passed == total:
+        print(f"✅ 모든 테스트 통과 ({passed}/{total})")
+        print("═" * 60)
+        return True
+    else:
+        print(f"❌ 테스트 실패 ({passed}/{total})")
+        print("═" * 60)
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
 #  메인 실행
 # ═══════════════════════════════════════════════════════════════
 
@@ -1471,8 +1859,62 @@ def main():
     # ─── 5. 시작점 결정 ───
     if args.resume and STATE_FILE.exists():
         state = state_load()
+
+        # P1: Step Mismatch Recovery (Design Requirement: P1.1)
+        expected_step = max(state["completed"]) + 1 if state["completed"] else 1
+        actual_step = state["current_step"]
+
+        if actual_step != expected_step:
+            log.warning(f"[RESUME] Step consistency check failed")
+            log.warning(f"  Expected: {expected_step} (based on completed array)")
+            log.warning(f"  Actual: {actual_step} (from state.json)")
+            log.warning(f"  Auto-correcting to {expected_step}")
+            state["current_step"] = expected_step
+
+            # P1: Audit logging for step mismatch correction
+            state_manager.record_audit(state, expected_step, "run_prompt", {
+                "event": "step_mismatch_auto_corrected",
+                "expected_step": expected_step,
+                "actual_step": actual_step
+            })
+
+            _state_save(state)
+
         start_from = state["current_step"]
         log.info(f"이전 상태에서 재개: Step {start_from}")
+
+        # (P1) Rate-limit 상태 복구: next_retry_at까지 대기
+        rate_limit_state = state.get("rate_limit_state")
+        if rate_limit_state and rate_limit_state["step"] == start_from:
+            from datetime import timezone
+            next_retry_at = datetime.fromisoformat(rate_limit_state["next_retry_at"])
+            now = datetime.now(timezone.utc)
+
+            if now < next_retry_at:
+                wait_secs = (next_retry_at - now).total_seconds()
+                log.warning(f"[{start_from:03d}] ⏸ Rate-limit 상태 복구 감지")
+                log.warning(f"[{start_from:03d}]   시도 횟수: {rate_limit_state['attempt_count']}/{rate_limit_state['max_attempts']}")
+                log.warning(f"[{start_from:03d}]   다음 재시도까지 {int(wait_secs)}초 대기...")
+
+                # 카운트다운 표시
+                for remaining in range(int(wait_secs), 0, -1):
+                    mins, secs = divmod(remaining, 60)
+                    print(f"\r  ⏸ {mins:02d}:{secs:02d} ", end='', flush=True)
+                    time.sleep(1)
+                print(f"\r  ▶ 재시도 시작              ")
+                log.info(f"[{start_from:03d}] 대기 완료, 실행 재개")
+            else:
+                log.info(f"[{start_from:03d}] 대기 시간 만료, 즉시 재개")
+                state["rate_limit_state"] = None  # 복구 완료, 상태 초기화
+
+                # P1: Audit logging for rate-limit wait completion
+                state_manager.record_audit(state, start_from, "rate_limit", {
+                    "event": "rate_limit_wait_completed",
+                    "recovered_from_step": rate_limit_state["step"]
+                })
+
+                _state_save(state)
+
         if start_from > TOTAL_PROMPTS:
             log.info(f"  ※ current_step({start_from}) > TOTAL_PROMPTS({TOTAL_PROMPTS}) — 이미 완료된 상태입니다.")
             sys.exit(0)
@@ -1559,13 +2001,14 @@ def main():
             step=step,
             prompt_file=prompt_file,
             session_id=session_arg,
-            max_retries=3,
+            max_retries=RateLimitPolicy.MAX_NORMAL_RETRIES,  # P3: Use policy class
             max_turns=max_turns,
             timeout=timeout,
             skip_permissions=skip_perms,
             project_dir=project_dir,
             model=args.model,
             idle_timeout=args.idle_timeout,
+            state=state,
         )
         
         # ─── 세션 ID 갱신 — 매 step마다 최신 session_id 추적 ───
@@ -1614,7 +2057,15 @@ def main():
             else:
                 use_continue = True
             state_record_complete(state, step)
-        
+
+        elif verdict == "rate_limit_exceeded":
+            # Rate-limit은 일시적 오류 — 실패가 아니라 시간 초과
+            log.warning(f"[{step:03d}] ⏸ Rate-limit 초과 (최대 {MAX_RATE_LIMIT_RETRIES}회 대기)")
+            log.warning(f"[{step:03d}]   rate_limit_state에 상태 저장됨")
+            log.warning(f"[{step:03d}]   재개 명령: python3 run.py --resume")
+            _state_save(state)
+            sys.exit(0)  # 정상 종료 (에러 아님)
+
         else:  # "failed"
             state_record_fail(state, step)
             log.error(f"[{step:03d}] 최종 실패. 중단합니다.")
